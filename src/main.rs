@@ -52,15 +52,6 @@ async fn main() {
         proxy_api_key,
     });
 
-    // Fetch and log public IP at startup
-    match state.client.get("https://api.ipify.org").send().await {
-        Ok(resp) => match resp.text().await {
-            Ok(ip) => info!("[STARTUP] Public IP address: {}", ip.trim()),
-            Err(e) => warn!("[STARTUP] Failed to read public IP response: {}", e),
-        },
-        Err(e) => warn!("[STARTUP] Failed to fetch public IP: {}", e),
-    }
-
     let app = Router::new()
         .route("/health", any(health))
         .route("/{*path}", any(proxy_handler))
@@ -69,12 +60,26 @@ async fn main() {
             auth_middleware,
         ))
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state.clone());
 
     let addr = format!("0.0.0.0:{port}");
     info!("[STARTUP] Binance HTTPS proxy listening on {addr}");
     info!("[STARTUP] Spot API -> {SPOT_API_BASE}");
     info!("[STARTUP] Futures API -> {FUTURES_API_BASE}");
+
+    // Fetch public IP in background — don't block server startup
+    tokio::spawn(async move {
+        let timeout = tokio::time::Duration::from_secs(5);
+        match tokio::time::timeout(timeout, state.client.get("https://api.ipify.org").send()).await
+        {
+            Ok(Ok(resp)) => match resp.text().await {
+                Ok(ip) => info!("[STARTUP] Public IP address: {}", ip.trim()),
+                Err(e) => warn!("[STARTUP] Failed to read public IP response: {}", e),
+            },
+            Ok(Err(e)) => warn!("[STARTUP] Failed to fetch public IP: {}", e),
+            Err(_) => warn!("[STARTUP] Public IP fetch timed out after 5s"),
+        }
+    });
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -287,7 +292,7 @@ async fn proxy_handler(
     for (name, value) in headers.iter() {
         match name.as_str() {
             "host" | "x-proxy-api-key" | "x-proxy-sign" | "connection"
-            | "transfer-encoding" => {
+            | "transfer-encoding" | "accept-encoding" => {
                 skipped_headers.push(name.as_str().to_string());
             }
             _ => {
@@ -384,13 +389,14 @@ async fn proxy_handler(
 }
 
 fn truncate_for_log(bytes: &[u8], max_len: usize) -> String {
-    let s = String::from_utf8_lossy(bytes);
-    if s.len() <= max_len {
-        s.into_owned()
+    if bytes.len() <= max_len {
+        String::from_utf8_lossy(bytes).into_owned()
     } else {
+        // Truncate at byte level safely, then lossy-convert
+        let truncated = String::from_utf8_lossy(&bytes[..max_len]);
         format!(
             "{}...<truncated, {} total bytes>",
-            &s[..max_len],
+            truncated,
             bytes.len()
         )
     }
