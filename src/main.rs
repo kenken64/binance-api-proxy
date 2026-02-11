@@ -157,12 +157,13 @@ fn sign(secret: &str, payload: &str) -> String {
 }
 
 /// Check if this request should be signed.
-/// Clients signal this by including `X-Proxy-Sign: true` header.
+/// All requests are signed by default. Clients can opt out with `X-Proxy-Sign: false`.
 fn should_sign(headers: &HeaderMap) -> bool {
     headers
         .get("X-Proxy-Sign")
         .and_then(|v| v.to_str().ok())
-        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+        .map(|v| !v.eq_ignore_ascii_case("false"))
+        .unwrap_or(true)
 }
 
 /// Append `timestamp` and `signature` to a query string.
