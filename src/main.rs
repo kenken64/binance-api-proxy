@@ -48,6 +48,15 @@ async fn main() {
         proxy_api_key,
     });
 
+    // Fetch and log public IP at startup
+    match state.client.get("https://api.ipify.org").send().await {
+        Ok(resp) => match resp.text().await {
+            Ok(ip) => info!("[STARTUP] Public IP address: {}", ip.trim()),
+            Err(e) => warn!("[STARTUP] Failed to read public IP response: {}", e),
+        },
+        Err(e) => warn!("[STARTUP] Failed to fetch public IP: {}", e),
+    }
+
     let app = Router::new()
         .route("/health", any(health))
         .route("/{*path}", any(proxy_handler))
@@ -59,7 +68,7 @@ async fn main() {
         .with_state(state);
 
     let addr = format!("0.0.0.0:{port}");
-    info!("Binance HTTPS proxy listening on {addr}");
+    info!("[STARTUP] Binance HTTPS proxy listening on {addr}");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
