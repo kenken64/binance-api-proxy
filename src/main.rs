@@ -8,16 +8,20 @@ use axum::{
     Router,
 };
 use bytes::Bytes;
+use hmac::{Hmac, Mac};
 use reqwest::Client;
+use sha2::Sha256;
 use std::sync::Arc;
-use tower_http::cors::CorsLayer;
 use std::time::Instant;
+use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
 
-const BINANCE_API_BASE: &str = "https://api.binance.com";
+const SPOT_API_BASE: &str = "https://api.binance.com";
+const FUTURES_API_BASE: &str = "https://fapi.binance.com";
+
+type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
-#[allow(dead_code)]
 struct AppState {
     client: Client,
     binance_api_key: String,
@@ -69,6 +73,8 @@ async fn main() {
 
     let addr = format!("0.0.0.0:{port}");
     info!("[STARTUP] Binance HTTPS proxy listening on {addr}");
+    info!("[STARTUP] Spot API -> {SPOT_API_BASE}");
+    info!("[STARTUP] Futures API -> {FUTURES_API_BASE}");
 
     let listener = tokio::net::TcpListener::bind(&addr).await.unwrap();
     axum::serve(listener, app).await.unwrap();
@@ -133,6 +139,66 @@ async fn auth_middleware(
     }
 }
 
+/// Determine the upstream base URL from the request path.
+fn resolve_base_url(path: &str) -> &'static str {
+    if path.starts_with("/fapi/") {
+        FUTURES_API_BASE
+    } else {
+        SPOT_API_BASE
+    }
+}
+
+/// Compute HMAC-SHA256 signature for Binance signed endpoints.
+fn sign(secret: &str, payload: &str) -> String {
+    let mut mac =
+        HmacSha256::new_from_slice(secret.as_bytes()).expect("HMAC accepts any key length");
+    mac.update(payload.as_bytes());
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// Check if this request should be signed.
+/// Clients signal this by including `X-Proxy-Sign: true` header.
+fn should_sign(headers: &HeaderMap) -> bool {
+    headers
+        .get("X-Proxy-Sign")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+}
+
+/// Append `timestamp` and `signature` to a query string.
+fn sign_query(query: Option<&str>, secret: &str) -> String {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+
+    let base = match query {
+        Some(q) if !q.is_empty() => format!("{q}&timestamp={timestamp}"),
+        _ => format!("timestamp={timestamp}"),
+    };
+
+    let signature = sign(secret, &base);
+    format!("{base}&signature={signature}")
+}
+
+/// Append `timestamp` and `signature` to a url-encoded request body.
+fn sign_body(body: &[u8], secret: &str) -> Vec<u8> {
+    let timestamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+
+    let existing = String::from_utf8_lossy(body);
+    let base = if existing.is_empty() {
+        format!("timestamp={timestamp}")
+    } else {
+        format!("{existing}&timestamp={timestamp}")
+    };
+
+    let signature = sign(secret, &base);
+    format!("{base}&signature={signature}").into_bytes()
+}
+
 async fn proxy_handler(
     State(state): State<Arc<AppState>>,
     method: Method,
@@ -142,14 +208,26 @@ async fn proxy_handler(
 ) -> impl IntoResponse {
     let start = Instant::now();
 
-    let path_and_query = uri
-        .path_and_query()
-        .map(|pq| pq.as_str())
-        .unwrap_or(uri.path());
+    let path = uri.path();
+    let base_url = resolve_base_url(path);
+    let needs_signing = should_sign(&headers);
 
-    let target_url = format!("{BINANCE_API_BASE}{path_and_query}");
+    debug!("[PROXY] Route: {} (sign={})", base_url, needs_signing);
 
-    info!("[PROXY] {} {} -> {}", method, path_and_query, target_url);
+    // Build the target URL, optionally signing the query string
+    let target_url = if needs_signing && (method == Method::GET || method == Method::DELETE) {
+        let signed_qs = sign_query(uri.query(), &state.binance_api_secret);
+        debug!("[SIGN] Signed query string: {}", signed_qs);
+        format!("{base_url}{path}?{signed_qs}")
+    } else {
+        let path_and_query = uri
+            .path_and_query()
+            .map(|pq| pq.as_str())
+            .unwrap_or(path);
+        format!("{base_url}{path_and_query}")
+    };
+
+    info!("[PROXY] {} {} -> {}", method, uri, target_url);
 
     // Log incoming headers (redact sensitive ones)
     debug!("[PROXY] Incoming headers:");
@@ -165,7 +243,11 @@ async fn proxy_handler(
     if body.is_empty() {
         debug!("[PROXY] Request body: <empty>");
     } else {
-        debug!("[PROXY] Request body ({} bytes): {}", body.len(), String::from_utf8_lossy(&body));
+        debug!(
+            "[PROXY] Request body ({} bytes): {}",
+            body.len(),
+            String::from_utf8_lossy(&body)
+        );
     }
 
     // Build the outgoing request
@@ -176,7 +258,8 @@ async fn proxy_handler(
     let mut skipped_headers = Vec::new();
     for (name, value) in headers.iter() {
         match name.as_str() {
-            "host" | "x-proxy-api-key" | "connection" | "transfer-encoding" => {
+            "host" | "x-proxy-api-key" | "x-proxy-sign" | "connection"
+            | "transfer-encoding" => {
                 skipped_headers.push(name.as_str().to_string());
             }
             _ => {
@@ -195,8 +278,16 @@ async fn proxy_handler(
     req_builder = req_builder.header("X-MBX-APIKEY", &state.binance_api_key);
     debug!("[PROXY] Injected X-MBX-APIKEY header");
 
-    // Forward request body
-    if !body.is_empty() {
+    // Forward request body, optionally signing it for POST/PUT
+    if needs_signing && (method == Method::POST || method == Method::PUT) {
+        let signed_body = sign_body(&body, &state.binance_api_secret);
+        debug!(
+            "[SIGN] Signed body ({} bytes): {}",
+            signed_body.len(),
+            String::from_utf8_lossy(&signed_body)
+        );
+        req_builder = req_builder.body(signed_body);
+    } else if !body.is_empty() {
         debug!("[PROXY] Forwarding request body ({} bytes)", body.len());
         req_builder = req_builder.body(body);
     }
@@ -211,7 +302,10 @@ async fn proxy_handler(
 
             info!(
                 "[RESPONSE] {} {} -> {} ({:.2?})",
-                method, path_and_query, status, elapsed
+                method,
+                uri,
+                status,
+                elapsed
             );
 
             // Log response headers
@@ -254,7 +348,7 @@ async fn proxy_handler(
             let elapsed = start.elapsed();
             error!(
                 "[RESPONSE] {} {} -> PROXY ERROR ({:.2?}): {}",
-                method, path_and_query, elapsed, e
+                method, uri, elapsed, e
             );
             (StatusCode::BAD_GATEWAY, format!("Proxy error: {e}")).into_response()
         }
@@ -266,6 +360,10 @@ fn truncate_for_log(bytes: &[u8], max_len: usize) -> String {
     if s.len() <= max_len {
         s.into_owned()
     } else {
-        format!("{}...<truncated, {} total bytes>", &s[..max_len], bytes.len())
+        format!(
+            "{}...<truncated, {} total bytes>",
+            &s[..max_len],
+            bytes.len()
+        )
     }
 }
