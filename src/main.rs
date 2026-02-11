@@ -156,17 +156,36 @@ fn sign(secret: &str, payload: &str) -> String {
     hex::encode(mac.finalize().into_bytes())
 }
 
-/// Check if this request should be signed.
-/// All requests are signed by default. Clients can opt out with `X-Proxy-Sign: false`.
-fn should_sign(headers: &HeaderMap) -> bool {
-    headers
-        .get("X-Proxy-Sign")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| !v.eq_ignore_ascii_case("false"))
-        .unwrap_or(true)
+/// Check if this request should be signed by the proxy.
+/// Skips signing if the request already contains a `signature` param (client-side signed)
+/// or if the client explicitly sets `X-Proxy-Sign: false`.
+fn should_sign(headers: &HeaderMap, query: Option<&str>, body: &[u8]) -> bool {
+    // Explicit opt-out
+    if let Some(v) = headers.get("X-Proxy-Sign").and_then(|v| v.to_str().ok()) {
+        if v.eq_ignore_ascii_case("false") {
+            return false;
+        }
+    }
+
+    // Skip if client already signed (signature present in query or body)
+    if let Some(q) = query {
+        if q.contains("signature=") {
+            debug!("[SIGN] Skipping — signature already present in query string");
+            return false;
+        }
+    }
+    if !body.is_empty() {
+        let body_str = String::from_utf8_lossy(body);
+        if body_str.contains("signature=") {
+            debug!("[SIGN] Skipping — signature already present in request body");
+            return false;
+        }
+    }
+
+    true
 }
 
-/// Append `timestamp` and `signature` to a query string.
+/// Append `timestamp` (if missing) and `signature` to a query string.
 fn sign_query(query: Option<&str>, secret: &str) -> String {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -174,7 +193,13 @@ fn sign_query(query: Option<&str>, secret: &str) -> String {
         .as_millis();
 
     let base = match query {
-        Some(q) if !q.is_empty() => format!("{q}&timestamp={timestamp}"),
+        Some(q) if !q.is_empty() => {
+            if q.contains("timestamp=") {
+                q.to_string()
+            } else {
+                format!("{q}&timestamp={timestamp}")
+            }
+        }
         _ => format!("timestamp={timestamp}"),
     };
 
@@ -182,7 +207,7 @@ fn sign_query(query: Option<&str>, secret: &str) -> String {
     format!("{base}&signature={signature}")
 }
 
-/// Append `timestamp` and `signature` to a url-encoded request body.
+/// Append `timestamp` (if missing) and `signature` to a url-encoded request body.
 fn sign_body(body: &[u8], secret: &str) -> Vec<u8> {
     let timestamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -192,6 +217,8 @@ fn sign_body(body: &[u8], secret: &str) -> Vec<u8> {
     let existing = String::from_utf8_lossy(body);
     let base = if existing.is_empty() {
         format!("timestamp={timestamp}")
+    } else if existing.contains("timestamp=") {
+        existing.into_owned()
     } else {
         format!("{existing}&timestamp={timestamp}")
     };
@@ -211,7 +238,7 @@ async fn proxy_handler(
 
     let path = uri.path();
     let base_url = resolve_base_url(path);
-    let needs_signing = should_sign(&headers);
+    let needs_signing = should_sign(&headers, uri.query(), &body);
 
     debug!("[PROXY] Route: {} (sign={})", base_url, needs_signing);
 
